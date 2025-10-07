@@ -1,60 +1,99 @@
-FROM node:24-alpine AS builder
+# ==========================================
+# Stage 1: Builder
+# ==========================================
+FROM node:22-alpine AS builder
 
-RUN apk update && \
-    apk add --no-cache git ffmpeg wget curl bash openssl
-
-LABEL version="2.3.1" description="Api to control whatsapp features through http requests." 
-LABEL maintainer="Davidson Gomes" git="https://github.com/DavidsonGomes"
-LABEL contact="contato@evolution-api.com"
+# Instalar dependências necessárias para build
+RUN apk update && apk add --no-cache \
+    git \
+    ffmpeg \
+    wget \
+    curl \
+    bash \
+    openssl \
+    python3 \
+    make \
+    g++ \
+    cairo-dev \
+    jpeg-dev \
+    pango-dev \
+    giflib-dev \
+    pixman-dev
 
 WORKDIR /evolution
 
-COPY ./package*.json ./
-COPY ./tsconfig.json ./
-COPY ./tsup.config.ts ./
+# Copiar arquivos de configuração
+COPY package*.json ./
+COPY tsconfig.json ./
+COPY tsup.config.ts ./
 
-RUN npm install --silent
+# Configurar npm para lidar melhor com dependências nativas
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
 
+# Instalar dependências (usar ci se tiver lock file atualizado)
+RUN npm install --loglevel=verbose || npm ci
+
+# Copiar código fonte
 COPY ./src ./src
 COPY ./public ./public
 COPY ./prisma ./prisma
 COPY ./manager ./manager
 COPY ./.env.example ./.env
 COPY ./runWithProvider.js ./
-
 COPY ./Docker ./Docker
 
-RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
+# Preparar scripts e gerar database
+RUN chmod +x ./Docker/scripts/* && \
+    (dos2unix ./Docker/scripts/* 2>/dev/null || true)
 
-RUN ./Docker/scripts/generate_database.sh
+# Gerar Prisma Client
+RUN npx prisma generate
 
+# Build do projeto
 RUN npm run build
 
-FROM node:24-alpine AS final
+# ==========================================
+# Stage 2: Runtime (imagem final)
+# ==========================================
+FROM node:22-alpine
 
-RUN apk update && \
-    apk add tzdata ffmpeg bash openssl
-
-ENV TZ=America/Sao_Paulo
-ENV DOCKER_ENV=true
+# Instalar apenas dependências de runtime
+RUN apk update && apk add --no-cache \
+    tzdata \
+    ffmpeg \
+    bash \
+    openssl \
+    cairo \
+    jpeg \
+    pango \
+    giflib \
+    pixman
 
 WORKDIR /evolution
 
-COPY --from=builder /evolution/package.json ./package.json
-COPY --from=builder /evolution/package-lock.json ./package-lock.json
-
+# Copiar do builder
+COPY --from=builder /evolution/package.json ./
+COPY --from=builder /evolution/package-lock.json ./
 COPY --from=builder /evolution/node_modules ./node_modules
 COPY --from=builder /evolution/dist ./dist
 COPY --from=builder /evolution/prisma ./prisma
 COPY --from=builder /evolution/manager ./manager
 COPY --from=builder /evolution/public ./public
-COPY --from=builder /evolution/.env ./.env
+COPY --from=builder /evolution/.env ./
 COPY --from=builder /evolution/Docker ./Docker
-COPY --from=builder /evolution/runWithProvider.js ./runWithProvider.js
-COPY --from=builder /evolution/tsup.config.ts ./tsup.config.ts
+COPY --from=builder /evolution/runWithProvider.js ./
 
-ENV DOCKER_ENV=true
+# Variáveis de ambiente
+ENV NODE_ENV=production
+ENV TZ=America/Sao_Paulo
 
+# Expor porta
 EXPOSE 8080
 
-ENTRYPOINT ["/bin/bash", "-c", ". ./Docker/scripts/deploy_database.sh && npm run start:prod" ]
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Comando de inicialização
+CMD ["node", "dist/index.js"]
